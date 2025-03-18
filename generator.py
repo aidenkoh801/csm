@@ -1,5 +1,5 @@
 from dataclasses import dataclass
-from typing import List, Tuple
+from typing import Iterable, List, Tuple
 
 import torch
 import torchaudio
@@ -100,6 +100,76 @@ class Generator:
 
         return torch.cat([text_tokens, audio_tokens], dim=0), torch.cat([text_masks, audio_masks], dim=0)
 
+    # @torch.inference_mode()
+    # def generate(
+    #     self,
+    #     text: str,
+    #     speaker: int,
+    #     context: List[Segment],
+    #     max_audio_length_ms: float = 90_000,
+    #     temperature: float = 0.9,
+    #     topk: int = 50,
+    #     chunk: int = 20
+    # ) -> torch.Tensor:
+    #     self._model.reset_caches()
+
+    #     max_audio_frames = int(max_audio_length_ms / 80)
+    #     tokens, tokens_mask = [], []
+    #     for segment in context:
+    #         segment_tokens, segment_tokens_mask = self._tokenize_segment(segment)
+    #         tokens.append(segment_tokens)
+    #         tokens_mask.append(segment_tokens_mask)
+
+    #     gen_segment_tokens, gen_segment_tokens_mask = self._tokenize_text_segment(text, speaker)
+    #     tokens.append(gen_segment_tokens)
+    #     tokens_mask.append(gen_segment_tokens_mask)
+
+    #     prompt_tokens = torch.cat(tokens, dim=0).long().to(self.device)
+    #     prompt_tokens_mask = torch.cat(tokens_mask, dim=0).bool().to(self.device)
+
+    #     audio_parts = []
+    #     buffer = []
+    #     curr_tokens = prompt_tokens.unsqueeze(0)
+    #     curr_tokens_mask = prompt_tokens_mask.unsqueeze(0)
+    #     curr_pos = torch.arange(0, prompt_tokens.size(0)).unsqueeze(0).long().to(self.device)
+
+    #     max_seq_len = 2048 - max_audio_frames
+    #     if curr_tokens.size(1) >= max_seq_len:
+    #         raise ValueError(f"Inputs too long, must be below max_seq_len - max_audio_frames: {max_seq_len}")
+
+    #     for _ in range(max_audio_frames):
+    #         sample = self._model.generate_frame(curr_tokens, curr_tokens_mask, curr_pos, temperature, topk)
+    #         if torch.all(sample == 0):
+    #             break  # eos
+
+    #         buffer.append(sample)
+
+    #         # Update current tokens and position for next generation
+    #         curr_tokens = torch.cat([sample, torch.zeros(1, 1).long().to(self.device)], dim=1).unsqueeze(1)
+    #         curr_tokens_mask = torch.cat(
+    #             [torch.ones_like(sample).bool(), torch.zeros(1, 1).bool().to(self.device)], dim=1
+    #         ).unsqueeze(1)
+    #         curr_pos = curr_pos[:, -1:] + 1
+
+    #         # Process buffer if it reaches the chunk size
+    #         if len(buffer) >= chunk:
+    #             chunk_tokens = torch.stack(buffer)
+    #             chunk_tokens = chunk_tokens.permute(1, 2, 0).contiguous()
+    #             decoded_audio = self._audio_tokenizer.decode(chunk_tokens).squeeze(0).squeeze(0)
+    #             audio_parts.append(decoded_audio.cpu())  # Move to CPU to free GPU memory
+    #             buffer = []
+
+    #     # Process remaining tokens in buffer
+    #     if len(buffer) > 0:
+    #         chunk_tokens = torch.stack(buffer)
+    #         chunk_tokens = chunk_tokens.permute(1, 2, 0).contiguous()
+    #         decoded_audio = self._audio_tokenizer.decode(chunk_tokens).squeeze(0).squeeze(0)
+    #         audio_parts.append(decoded_audio.cpu())
+
+    #     # Combine all audio chunks
+    #     audio = torch.cat(audio_parts, dim=0) if audio_parts else torch.tensor([], device=self.device)
+    #     return audio
+# In generator.py
     @torch.inference_mode()
     def generate(
         self,
@@ -109,8 +179,8 @@ class Generator:
         max_audio_length_ms: float = 90_000,
         temperature: float = 0.9,
         topk: int = 50,
-        chunk: int = 20
-    ) -> torch.Tensor:
+        chunk_size: int = 20  # Changed parameter name
+    ) -> Iterable[torch.Tensor]:  # Now returns generator
         self._model.reset_caches()
 
         max_audio_frames = int(max_audio_length_ms / 80)
@@ -127,7 +197,6 @@ class Generator:
         prompt_tokens = torch.cat(tokens, dim=0).long().to(self.device)
         prompt_tokens_mask = torch.cat(tokens_mask, dim=0).bool().to(self.device)
 
-        audio_parts = []
         buffer = []
         curr_tokens = prompt_tokens.unsqueeze(0)
         curr_tokens_mask = prompt_tokens_mask.unsqueeze(0)
@@ -143,38 +212,28 @@ class Generator:
                 break  # eos
 
             buffer.append(sample)
-
-            # Update current tokens and position for next generation
             curr_tokens = torch.cat([sample, torch.zeros(1, 1).long().to(self.device)], dim=1).unsqueeze(1)
             curr_tokens_mask = torch.cat(
                 [torch.ones_like(sample).bool(), torch.zeros(1, 1).bool().to(self.device)], dim=1
             ).unsqueeze(1)
             curr_pos = curr_pos[:, -1:] + 1
 
-            # Process buffer if it reaches the chunk size
-            if len(buffer) >= chunk:
-                chunk_tokens = torch.stack(buffer)
-                chunk_tokens = chunk_tokens.permute(1, 2, 0).contiguous()
-                decoded_audio = self._audio_tokenizer.decode(chunk_tokens).squeeze(0).squeeze(0)
-                audio_parts.append(decoded_audio.cpu())  # Move to CPU to free GPU memory
+            if len(buffer) >= chunk_size:
+                chunk_tokens = torch.stack(buffer).permute(1, 2, 0).contiguous()
+                decoded_audio = self._audio_tokenizer.decode(chunk_tokens).squeeze(0).squeeze(0).cpu()
+                yield decoded_audio
                 buffer = []
 
-        # Process remaining tokens in buffer
-        if len(buffer) > 0:
-            chunk_tokens = torch.stack(buffer)
-            chunk_tokens = chunk_tokens.permute(1, 2, 0).contiguous()
-            decoded_audio = self._audio_tokenizer.decode(chunk_tokens).squeeze(0).squeeze(0)
-            audio_parts.append(decoded_audio.cpu())
-
-        # Combine all audio chunks
-        audio = torch.cat(audio_parts, dim=0) if audio_parts else torch.tensor([], device=self.device)
-        return audio
+        if buffer:
+            chunk_tokens = torch.stack(buffer).permute(1, 2, 0).contiguous()
+            decoded_audio = self._audio_tokenizer.decode(chunk_tokens).squeeze(0).squeeze(0).cpu()
+            yield decoded_audio
 
 
 
 def load_csm_1b(device: str = "cuda") -> Generator:
     model = Model.from_pretrained("sesame/csm-1b")
     model.to(device=device, dtype=torch.bfloat16)
-
+    model.decoder = torch.compile(model.decoder, fullgraph=True, backend='cudagraphs')
     generator = Generator(model)
     return generator

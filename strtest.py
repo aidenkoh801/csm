@@ -1,33 +1,50 @@
 import torchaudio
-from generator import load_csm_1b
+from generator import Generator  # Import your Generator class
+import time
 import torch
-def test_streaming_generator():
-    # Initialize the generator
+from generator import load_csm_1b
+
+def test_streaming(
+    text: str = "Hello this is a streaming test",
+    speaker: int = 0,
+    output_path: str = "stream_test.wav",
+    max_audio_length_ms: float = 10_000,
+    chunk_size: int = 20
+):
+    # Initialize generator (use same initialization as your app)
     generator = load_csm_1b(device="cuda")
     
-    # Collect audio chunks
-    audio_chunks = []
-    for chunk in generator.generate(
-        text="Hello, this is great.",
-        speaker=0,
-        context=[],
-        max_audio_length_ms=5000,  # 5 seconds for quick test
-        temperature=0.9,
-        topk=50,
-        chunk_size=20
-    ):
-        audio_chunks.append(chunk.cpu())  # Move to CPU for saving
+    start_time = time.time()
     
+    # Collect all audio chunks
+    audio_chunks = []
+    audio_gen = generator.generate(
+        text=text,
+        speaker=speaker,
+        context=[],
+        max_audio_length_ms=max_audio_length_ms,
+        chunk_size=chunk_size
+    )
+    
+    for chunk in audio_gen:
+        print(f"Received chunk of {chunk.shape[0]/generator.sample_rate:.2f}s")
+        audio_chunks.append(chunk.cpu())
+    
+    # Combine and save
     if audio_chunks:
-        # Concatenate all 1D chunks along time dimension
         full_audio = torch.cat(audio_chunks, dim=0)
-        # Add channel dimension (shape becomes [1, time])
-        full_audio = full_audio.unsqueeze(0)
-        # Save to file
-        torchaudio.save("test_stream_output.wav", full_audio, generator.sample_rate)
-        print(f"Saved audio with {full_audio.shape[1]/generator.sample_rate:.2f} seconds duration")
+        torchaudio.save(
+            output_path,
+            full_audio.unsqueeze(0),
+            generator.sample_rate,
+            encoding="PCM_S",
+            bits_per_sample=16
+        )
+        print(f"Saved {full_audio.shape[0]/generator.sample_rate:.2f}s audio to {output_path}")
     else:
         print("No audio generated")
+    
+    print(f"Total processing time: {time.time()-start_time:.2f}s")
 
 if __name__ == "__main__":
-    test_streaming_generator()
+    test_streaming()
