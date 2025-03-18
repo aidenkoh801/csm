@@ -8,7 +8,6 @@ from models import Model
 from moshi.models import loaders
 from tokenizers.processors import TemplateProcessing
 from transformers import AutoTokenizer
-from watermarking import CSM_1B_GH_WATERMARK, load_watermarker, watermark
 
 
 @dataclass
@@ -51,8 +50,6 @@ class Generator:
         mimi = loaders.get_mimi(mimi_weight, device=device)
         mimi.set_num_codebooks(32)
         self._audio_tokenizer = mimi
-
-        self._watermarker = load_watermarker(device=device)
 
         self.sample_rate = mimi.sample_rate
         self.device = device
@@ -112,6 +109,7 @@ class Generator:
         max_audio_length_ms: float = 90_000,
         temperature: float = 0.9,
         topk: int = 50,
+        chunk: int = 20
     ) -> torch.Tensor:
         self._model.reset_caches()
 
@@ -129,7 +127,8 @@ class Generator:
         prompt_tokens = torch.cat(tokens, dim=0).long().to(self.device)
         prompt_tokens_mask = torch.cat(tokens_mask, dim=0).bool().to(self.device)
 
-        samples = []
+        audio_parts = []
+        buffer = []
         curr_tokens = prompt_tokens.unsqueeze(0)
         curr_tokens_mask = prompt_tokens_mask.unsqueeze(0)
         curr_pos = torch.arange(0, prompt_tokens.size(0)).unsqueeze(0).long().to(self.device)
@@ -143,24 +142,34 @@ class Generator:
             if torch.all(sample == 0):
                 break  # eos
 
-            samples.append(sample)
+            buffer.append(sample)
 
+            # Update current tokens and position for next generation
             curr_tokens = torch.cat([sample, torch.zeros(1, 1).long().to(self.device)], dim=1).unsqueeze(1)
             curr_tokens_mask = torch.cat(
                 [torch.ones_like(sample).bool(), torch.zeros(1, 1).bool().to(self.device)], dim=1
             ).unsqueeze(1)
             curr_pos = curr_pos[:, -1:] + 1
 
-        audio = self._audio_tokenizer.decode(torch.stack(samples).permute(1, 2, 0)).squeeze(0).squeeze(0)
+            # Process buffer if it reaches the chunk size
+            if len(buffer) >= chunk:
+                chunk_tokens = torch.stack(buffer)
+                chunk_tokens = chunk_tokens.permute(1, 2, 0).contiguous()
+                decoded_audio = self._audio_tokenizer.decode(chunk_tokens).squeeze(0).squeeze(0)
+                audio_parts.append(decoded_audio.cpu())  # Move to CPU to free GPU memory
+                buffer = []
 
-        # This applies an imperceptible watermark to identify audio as AI-generated.
-        # Watermarking ensures transparency, dissuades misuse, and enables traceability.
-        # Please be a responsible AI citizen and keep the watermarking in place.
-        # If using CSM 1B in another application, use your own private key and keep it secret.
-        audio, wm_sample_rate = watermark(self._watermarker, audio, self.sample_rate, CSM_1B_GH_WATERMARK)
-        audio = torchaudio.functional.resample(audio, orig_freq=wm_sample_rate, new_freq=self.sample_rate)
+        # Process remaining tokens in buffer
+        if len(buffer) > 0:
+            chunk_tokens = torch.stack(buffer)
+            chunk_tokens = chunk_tokens.permute(1, 2, 0).contiguous()
+            decoded_audio = self._audio_tokenizer.decode(chunk_tokens).squeeze(0).squeeze(0)
+            audio_parts.append(decoded_audio.cpu())
 
+        # Combine all audio chunks
+        audio = torch.cat(audio_parts, dim=0) if audio_parts else torch.tensor([], device=self.device)
         return audio
+
 
 
 def load_csm_1b(device: str = "cuda") -> Generator:
